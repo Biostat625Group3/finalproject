@@ -1,0 +1,392 @@
+```{r}
+#install.packages("devtools")
+#devtools :: install_github("immunogenomics/presto")
+library(Seurat)
+library(ggplot2)
+library(dplyr)
+library(future)
+library(SingleR)
+library(celldex)
+
+```
+
+# Import and Merge#(DONT RUN)
+```{r}
+load_and_merge_seurat <- function(data_dir) {
+  # List all subdirectories
+  sample_dirs <- list.dirs(data_dir, full.names = TRUE, recursive = FALSE)
+  
+  # Initialize an empty list to store Seurat objects
+  seurat_list <- list()
+  
+  # Loop through each subdirectory
+  for (dir in sample_dirs) {
+    # Extract sample ID from the folder name
+    sample_id <- basename(dir)  # Example: GSM7225034_YW1
+    
+    # Determine age group (Young/Old) based on folder name
+    age_group <- ifelse(grepl("YW", sample_id), "Young", 
+                        ifelse(grepl("OW", sample_id), "Old", "Unknown"))
+    
+    # Load the 10X data from the directory
+    data <- Read10X(data.dir = dir)
+    
+    # Create a Seurat object
+    seurat_obj <- CreateSeuratObject(counts = data, project = sample_id)
+    
+    # Add metadata for sample ID and age group
+    seurat_obj$sample_id <- sample_id
+    seurat_obj$age_group <- age_group
+    
+    # Append to the list
+    seurat_list[[sample_id]] <- seurat_obj
+  }
+  
+  # Merge all Seurat objects into one
+  combined_seurat <- merge(
+    x = seurat_list[[1]], 
+    y = seurat_list[-1], 
+    add.cell.ids = names(seurat_list),
+    project = "Combined_Seurat"
+  )
+  
+  return(combined_seurat)
+}
+
+# Example Usage
+data_dir <- "data"  # Path to the directory containing the sample folders
+seurat_object <- load_and_merge_seurat(data_dir)
+
+# Example Usage
+# data_dir <- "data"  # Path to the folder containing the 10X data
+# seurat_object <- read_and_label_10x(data_dir)
+
+# saveRDS(seurat_object, file = "combined_seurat_object.rds")
+```
+
+# Preprocessing
+```{r}
+# Preprocessing Function for Seurat Objects
+preprocess_seurat <- function(seurat_object, 
+                              min_features = 200, 
+                              max_features = 6000, 
+                              min_counts = 500, 
+                              min_cells_per_gene = 10,
+                              variable_genes = 3000) {
+  
+  # Step 0: Increase memory for parallel operations
+  options(future.globals.maxSize = 30 * 1024^3)  # Set to 30 GB
+  future::plan("sequential")  # Avoid parallel processing to reduce memory usage
+  
+  # Step 1: Filter low-quality cells
+  seurat_object <- subset(seurat_object, 
+                          subset = nFeature_RNA > min_features & 
+                                   nFeature_RNA < max_features & 
+                                   nCount_RNA > min_counts)
+  cat("Step 1: Filtered cells with low/high read counts. Remaining cells:", ncol(seurat_object), "\n")
+  
+  # Step 2: Remove ambiguous and mitochondrial genes
+  gene_names <- rownames(seurat_object)
+  filtered_genes <- gene_names[!grepl("^Gm-|^mt-|^MT-", gene_names)]
+  seurat_object <- subset(seurat_object, features = filtered_genes)
+  cat("Step 2: Removed ambiguous and mitochondrial genes. Remaining genes:", nrow(seurat_object), "\n")
+  
+  # Step 3: Filter genes expressed in fewer than 'min_cells_per_gene' cells
+  # Use the "raw" layer for Seurat v5
+  counts_matrix <- GetAssayData(seurat_object, layer = "raw")
+  gene_filter <- Matrix::rowSums(counts_matrix > 0) >= min_cells_per_gene
+  seurat_object <- subset(seurat_object, features = rownames(seurat_object)[gene_filter])
+  cat("Step 3: Filtered lowly expressed genes. Remaining genes:", nrow(seurat_object), "\n")
+  
+  # Step 4: Normalize data and identify highly variable genes using SCTransform
+  seurat_object <- SCTransform(seurat_object, 
+                               variable.features.n = variable_genes, 
+                               verbose = FALSE)
+  cat("Step 4: Performed SCTransform and selected", variable_genes, "highly variable genes.\n")
+  
+  # Return preprocessed Seurat object
+  return(seurat_object)
+}
+
+# Example Usage
+# Assuming 'seurat_object' is already loaded
+seurat_object <- preprocess_seurat(
+  seurat_object,
+  min_features = 200,       # Minimum genes per cell
+  max_features = 6000,      # Maximum genes per cell
+  min_counts = 500,         # Minimum total read counts per cell
+  min_cells_per_gene = 50,  # Minimum cells per gene
+  variable_genes = 3000     # Number of highly variable genes
+)
+
+# saveRDS(seurat_object, file = "preprocess_seurat.rds")
+
+seurat_object <- readRDS("preprocess_seurat.rds") #SAVE OBJECT PREVIOUS LOAD HERE
+
+```
+
+# Perform PCA and find optimal number of components
+```{r}
+perform_pca <- function(seurat_object, num_pcs = NULL) {
+  # Run PCA and generat elbow plot
+  seurat_object <- RunPCA(seurat_object, verbose = FALSE)
+  
+  # print(ElbowPlot(seurat_object, ndims = 50))
+  # If num_pcs is specified, select the number of PCs
+  if (!is.null(num_pcs)) {
+    seurat_object <- RunPCA(seurat_object, npcs = num_pcs, verbose = FALSE)
+  }
+  
+  return(seurat_object)
+}
+
+# perform_pca_and_elbow(seurat_object)
+
+seurat_object <- perform_pca(seurat_object, num_pcs = 20)
+```
+
+# Generate UMAP
+```{r}
+perform_umap <- function(seurat_object, num_pcs = 20) {
+  # run nearest neighbors and perform UMAP
+  seurat_object <- FindNeighbors(seurat_object, dims = 1:num_pcs, k.param = 20, metric = "cosine")
+  
+  seurat_object <- RunUMAP(seurat_object, dims = 1:num_pcs, metric = "cosine")
+  
+  return(seurat_object)
+}
+
+seurat_object <- perform_umap(seurat_object, num_pcs = 20)
+```
+
+```{r}
+perform_louvain_clustering <- function(seurat_object, resolution = 0.5) {
+  # Perform Louvain clustering
+  seurat_object <- FindNeighbors(seurat_object, reduction = "umap", dims = 1:2)
+  seurat_object <- FindClusters(seurat_object, resolution = resolution, algorithm = 1) # Louvain method
+  
+  return(seurat_object)
+}
+
+# Example usage:
+seurat_object <- perform_louvain_clustering(seurat_object, resolution = 0.5)
+
+```
+
+```{r}
+plot_embeddings <- function(seurat_object, group_by = "seurat_clusters", title = "UMAP Plot") {
+  DimPlot(seurat_object, reduction = "umap", group.by = group_by, label = TRUE, repel = TRUE) +
+    ggtitle(title) +
+    theme_minimal() + 
+    NoLegend()
+}
+
+plot_embeddings(seurat_object, group_by = "seurat_clusters", title = "Louvain Clusters")
+
+```
+
+#HERE, finding Markers
+```{r}
+find_markers <- function(seurat_object, num_cores = 10) {
+  library(future)
+  
+  # Check available memory and cores
+  cat("Using", num_cores, "cores for marker detection.\n")
+  
+  # Set up parallelization if more than 1 core is used
+  if (num_cores > 1) {
+    future::plan("multicore", workers = num_cores)  # Use "multisession" for Windows
+  }
+  
+  # Prepare Seurat object for marker detection
+  cat("Preparing Seurat object for marker detection...\n")
+  seurat_object <- PrepSCTFindMarkers(seurat_object)
+  
+  # Get cluster levels
+  clusters <- levels(seurat_object$seurat_clusters)
+  cat("Identifying markers for", length(clusters), "clusters.\n")
+  
+  # Initialize an empty list to store markers
+  markers <- list()
+  
+  # Identify markers cluster by cluster to reduce memory usage
+  for (cluster in clusters) {
+    cat("Processing cluster", cluster, "...\n")
+    cluster_markers <- FindMarkers(
+      seurat_object,
+      ident.1 = cluster,
+      only.pos = TRUE,
+      min.pct = 0.25,
+      logfc.threshold = 0.25
+    )
+    cluster_markers$cluster <- cluster  # Add cluster identifier to markers
+    markers[[cluster]] <- cluster_markers
+  }
+  
+  # Combine marker results into a single data frame
+  all_markers <- do.call(rbind, markers)
+  
+  # Reset to sequential processing
+  if (num_cores > 1) {
+    future::plan("sequential")
+  }
+  
+  return(all_markers)
+}
+
+# Example usage:
+# Assuming seurat_object is already loaded and properly prepared
+# markers <- find_markers(seurat_object, num_cores = 10)
+#saveRDS(markers, file = "markers.rds")
+
+```
+
+
+#Annotation
+```{r}
+markers <- readRDS("markers.rds")
+annotate_clusters <- function(seurat_object, markers) {
+  # Load the Mouse RNA-seq reference dataset
+  ref <- celldex::MouseRNAseqData()
+  
+  # Extract normalized counts and cluster assignments
+  counts <- GetAssayData(seurat_object, layer = "data")
+  clusters <- seurat_object$seurat_clusters
+  
+  # Validate marker genes (optional, for debugging)
+  print(head(markers))  # Check the identified marker genes
+  
+  # Use SingleR to annotate clusters
+  cat("Running SingleR for cell type annotation...\n")
+  singleR_results <- SingleR(test = counts, ref = ref, labels = ref$label.main, clusters = clusters)
+  
+  # Add annotations to the Seurat object
+  seurat_object$celltype <- singleR_results$labels[as.numeric(seurat_object$seurat_clusters) + 1]
+  
+  return(seurat_object)
+}
+
+
+
+
+# Step 2: Annotate clusters using detected markers
+#seurat_object <- annotate_clusters(seurat_object, markers = markers)
+
+#saveRDS(seurat_object, file = "annotated_seurat_object.rds")
+
+```
+
+#Load and verify data
+```{r}
+# Load the annotated Seurat object
+seurat_object <- readRDS("annotated_seurat_object.rds")
+
+# Display the first few rows of the metadata to verify data structure
+head(seurat_object@meta.data)
+
+# Display unique cell type annotations to verify annotation quality
+unique(seurat_object$celltype)
+
+```
+
+
+# UMAP Plot with Cell Type Annotations
+```{r}
+
+DimPlot(seurat_object, reduction = "umap", group.by = "celltype",
+        label = TRUE, repel = TRUE) +
+  ggtitle("UMAP Plot with Cell Type Annotations") + 
+  theme_minimal()
+
+```
+
+
+# create datafram for further analysis
+```{r}
+# Extract the SCTransform matrix from the Seurat object
+sct_matrix <- GetAssayData(seurat_object, 
+                           assay = "SCT", 
+                           layer = "scale.data")
+
+# Display the dimensions of the SCTransform matrix
+cat("SCTransform matrix dimensions:", dim(sct_matrix), "\n")
+
+# Extract gene names from the SCTransform matrix
+gene_names <- rownames(sct_matrix)
+
+# Transpose the SCTransform matrix and convert it to a data frame
+sct_data_frame <- as.data.frame(t(sct_matrix))
+
+# Extract metadata information
+metadata <- seurat_object@meta.data
+
+# Ensure metadata is aligned with transposed data frame rows
+metadata <- metadata[rownames(sct_data_frame), ]
+
+# Add mouse ID and group information to the data frame
+sct_data_frame$Mouse_ID <- metadata$sample_id
+sct_data_frame$Group <- metadata$age_group
+sct_data_frame$cell_Type <- seurat_object$celltype
+
+# Verify the number of columns matches expected dimensions
+if(length(gene_names) + 3 == ncol(sct_data_frame)) {
+  colnames(sct_data_frame) <- c(gene_names, "Mouse_ID", "Group", "cell_Type")
+} else {
+  stop("The number of column names doesn't match the columns in the data frame.")
+}
+
+```
+
+
+#Verify Data Frame
+```{r}
+# Display the dimensions of the data frame to confirm structure
+cat("Data frame dimensions:", dim(sct_data_frame), "\n")
+
+# Print the first 10 columns of the data frame to verify content
+print(head(sct_data_frame[, 1:10]))
+print(head(sct_data_frame[,(ncol(sct_data_frame)-3) :
+                            ncol(sct_data_frame)]))
+
+write.csv(sct_data_frame, "sct_data_frame_with_annotations.csv",row.names = TRUE)
+
+```
+
+#save the data frame to a CSV file.
+```{r}
+
+# Save the data frame to a CSV file
+write.csv(sct_data_frame, "sct_data_frame_with_annotations.csv", row.names = TRUE)
+
+```
+
+
+
+#Create Subject IDs
+```{r}
+
+# Extract metadata and generate unique subject IDs
+metadata <- seurat_object@meta.data
+
+# Create unique subject IDs using sample_id to control for the mouse each cell comes from
+metadata$subject_id <- metadata$sample_id
+seurat_object$subject_id <- metadata$subject_id
+
+# Unique subject IDs are critical for controlling batch effects and ensuring that cell-specific analyses account for the mouse of origin. This is important for downstream analyses such as regression models, where you need to account for variability between different mice.
+
+# Display the first few rows of the metadata to verify subject IDs were added
+head(seurat_object@meta.data)
+
+# Save the updated Seurat object with subject IDs
+saveRDS(seurat_object, file = "annotated_seurat_with_subject_ids.rds")
+
+# List files in the current working directory to verify saved objects
+list.files()
+
+```
+
+
+```{r}
+
+
+```
